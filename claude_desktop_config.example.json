@@ -1,0 +1,10 @@
+{
+  "_comment": "Replace /path/to/unicornafl-mcp with the absolute path to your clone. setup.sh also writes a fully-resolved version of this file to ./claude_desktop_config.local.json which you can copy verbatim.",
+  "mcpServers": {
+    "unicornafl": {
+      "command": "/path/to/unicornafl-mcp/.venv/bin/python",
+      "args": ["/path/to/unicornafl-mcp/server.py"],
+      "env": { "PYTHONUNBUFFERED": "1" }
+    }
+  }
+}
