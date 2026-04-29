@@ -272,7 +272,7 @@ cat <<EOF
    $CLAUDE_CONFIG
 
  NEXT STEP:  fully quit and relaunch Claude Desktop, then check the tools
- panel — all 46 unicornafl-mcp tools should appear.
+ panel — all 48 unicornafl-mcp tools should appear.
 =========================================================================
 EOF
 else

@@ -923,8 +923,21 @@ def fuzz_replay_crash(crash_path: str, timeout_sec: int = 30) -> dict:
 # --------------------------------------------------------------------------- #
 
 import csv
+import itertools
 import random
 import struct
+
+
+# Field-encoding formats for seeds_from_struct_spec
+_INT_FMTS = {
+    "u8":     "<B",  "i8":     "<b",
+    "u16_le": "<H",  "u16_be": ">H",
+    "i16_le": "<h",  "i16_be": ">h",
+    "u32_le": "<I",  "u32_be": ">I",
+    "i32_le": "<i",  "i32_be": ">i",
+    "u64_le": "<Q",  "u64_be": ">Q",
+    "i64_le": "<q",  "i64_be": ">q",
+}
 
 
 def _capstone_for_session():
@@ -1295,6 +1308,136 @@ def template_seeds(prefix_hex: str = "", suffix_hex: str = "",
     return seed_add_many(seeds, target=target, job_id=job_id)
 
 
+@mcp.tool()
+def seeds_from_struct_spec(spec: dict, count: int = 32,
+                           target: str = "corpus", job_id: str = "",
+                           name_prefix: str = "spec") -> dict:
+    """Generate seeds from a structured field specification — the natural
+    bridge from IDA-derived (or hand-written) struct layouts into the corpus.
+
+    Each field can be a fixed value, a list of candidate values, or random.
+    The tool computes the Cartesian product of all explicit-value lists and
+    emits up to `count` seeds; if the product is smaller than `count`, the
+    remainder is filled by randomizing the choice independently per seed.
+
+    spec format:
+        {
+          "size": 32,                          # base payload size (fields can extend)
+          "seed": 0xCAFEB10B,                  # optional RNG seed
+          "fields": [
+            {"offset": 0,  "kind": "u32_le", "value":  0xAB7EC0DE},
+            {"offset": 4,  "kind": "u8",     "values": [0, 1, 2, 0xFF]},
+            {"offset": 8,  "kind": "u32_le", "values": [0, 0xFF, 0x10000]},
+            {"offset": 12, "kind": "bytes_random", "size": 20}
+          ]
+        }
+
+    Field kinds:
+        Integers (omit value/values to randomize):
+            u8 i8  u16_le u16_be i16_le i16_be
+            u32_le u32_be i32_le i32_be
+            u64_le u64_be i64_le i64_be
+        bytes_literal (hex="DEADBEEF" or values=["aa..","bb.."])
+        bytes_random  (size=N)              random bytes per seed
+        bytes_zero    (size=N)
+        bytes_repeat  (size=N, byte=0x41)
+
+    target: 'corpus' (work/in/) or 'inject' (live AFL foreign-sync dir).
+    """
+    if not isinstance(spec, dict):
+        return _err("spec must be a dict")
+    fields = spec.get("fields", [])
+    if not fields:
+        return _err("spec.fields is required and non-empty")
+    base_size = int(spec.get("size", 0))
+    rng = random.Random(int(spec.get("seed", 0xCAFEB10B)))
+
+    # Normalize each field into (offset, kind, candidates_or_None, extra)
+    normalized: list[tuple[int, str, Any, dict]] = []
+    for f in fields:
+        if "offset" not in f or "kind" not in f:
+            return _err(f"field missing offset/kind: {f}")
+        off, k = int(f["offset"]), str(f["kind"])
+        if k in _INT_FMTS:
+            cands: Any
+            if "value" in f:
+                cands = [int(f["value"])]
+            elif "values" in f:
+                cands = [int(v) for v in f["values"]]
+            else:
+                cands = None  # randomize
+            normalized.append((off, k, cands, {}))
+        elif k == "bytes_literal":
+            if "values" in f:
+                lits = [bytes.fromhex(re.sub(r"\s+", "", str(v))) for v in f["values"]]
+            elif "hex" in f:
+                lits = [bytes.fromhex(re.sub(r"\s+", "", f["hex"]))]
+            else:
+                return _err(f"bytes_literal needs hex or values: {f}")
+            normalized.append((off, k, lits, {}))
+        elif k in ("bytes_random", "bytes_zero", "bytes_repeat"):
+            normalized.append((off, k, None,
+                               {"size": int(f.get("size", 0)),
+                                "byte": int(f.get("byte", 0x41))}))
+        else:
+            return _err(f"unknown field kind: {k!r}")
+
+    # Compute total payload size (max of explicit size + furthest field)
+    total = base_size
+    for off, k, cands, extra in normalized:
+        if k in _INT_FMTS:
+            end = off + struct.calcsize(_INT_FMTS[k])
+        elif k == "bytes_literal":
+            end = off + max(len(c) for c in cands)
+        else:
+            end = off + extra["size"]
+        if end > total:
+            total = end
+    if total <= 0:
+        return _err("computed payload size is 0 — fields produce no bytes")
+
+    # Build candidate axes for the cross-product
+    axes = [c if c is not None else [None] for (_, _, c, _) in normalized]
+    combos = list(itertools.islice(itertools.product(*axes), count))
+    while len(combos) < count:
+        combos.append(tuple(rng.choice(a) if a != [None] else None for a in axes))
+
+    # Emit seeds
+    out_seeds = []
+    for i, combo in enumerate(combos):
+        buf = bytearray(total)
+        for ((off, k, _, extra), v) in zip(normalized, combo):
+            if k in _INT_FMTS:
+                fmt = _INT_FMTS[k]
+                width = struct.calcsize(fmt)
+                if v is None:
+                    buf[off:off+width] = bytes(rng.randint(0, 255) for _ in range(width))
+                else:
+                    if k.startswith("u"):
+                        v_packed = v & ((1 << (width * 8)) - 1)
+                    else:
+                        v_packed = v
+                    try:
+                        buf[off:off+width] = struct.pack(fmt, v_packed)
+                    except struct.error as e:
+                        return _err(f"pack {k}={v} failed: {e}")
+            elif k == "bytes_literal":
+                data = v if isinstance(v, (bytes, bytearray)) else b""
+                buf[off:off+len(data)] = data
+            elif k == "bytes_random":
+                sz = extra["size"]
+                buf[off:off+sz] = bytes(rng.randint(0, 255) for _ in range(sz))
+            elif k == "bytes_zero":
+                pass  # already zero
+            elif k == "bytes_repeat":
+                sz, byte = extra["size"], extra["byte"]
+                buf[off:off+sz] = bytes([byte & 0xFF]) * sz
+        out_seeds.append({"name": f"{name_prefix}_{i:04d}",
+                          "hex": bytes(buf).hex()})
+
+    return seed_add_many(out_seeds, target=target, job_id=job_id)
+
+
 # ---------- (3) Coverage plateau / live injection ---------- #
 
 def _read_plot_data(job: FuzzJob) -> tuple[list[str], list[list[str]]]:
@@ -1387,6 +1530,163 @@ def fuzz_inject_seed(hex_data: str, name: str = "", job_id: str = "") -> dict:
 
 
 @mcp.tool()
+def fuzz_break_plateau(job_id: str = "",
+                       code_start: int = 0, code_end: int = 0,
+                       offsets: list[int] | None = None,
+                       count: int = 24,
+                       strategies: list[str] | None = None,
+                       seed: int = 0xCAFEB10B) -> dict:
+    """Mechanically break a coverage plateau by injecting *structurally-aware*
+    seeds that AFL++'s built-in mutators won't naturally try.
+
+    AFL++ already does random bit-flips, arithmetic, and havoc — that's why
+    plateau happened. This tool does what AFL can't, because it requires
+    knowledge of the target's code:
+
+        magic_overlay   Extract immediates from [code_start, code_end] via
+                        find_immediates, then overlay each (u32-LE / u64-LE)
+                        at common header-field offsets of random corpus seeds.
+                        This is the single biggest plateau-breaker for parsers
+                        with magic-byte gates.
+        length_probe    Write boundary length values (0, 1, 0xFF, 0x100, 0xFFF,
+                        0x1000, 0x7FFF, 0x8000, 0xFFFF, 0x10000) at typical
+                        length-field offsets (4, 6, 8) of corpus seeds.
+        splice          Concatenate halves of two random corpus seeds —
+                        AFL++ has its own splice but only between favorites,
+                        and only after long stalls.
+
+    Generated seeds are written into the live AFL inject directory, so a
+    running campaign picks them up via foreign-sync without restart.
+
+    Args:
+        job_id: Fuzz job to inject into. Empty = most recent.
+        code_start/code_end: Range to scan for immediates. If both 0,
+            magic_overlay is skipped (still useful as a length+splice tool).
+        offsets: Byte offsets at which to overlay magics. Default: typical
+            header field positions [0, 4, 8, 12, 16, 24, 32].
+        count: Approximate total seeds to generate (split across strategies).
+        strategies: Subset of {'magic_overlay', 'length_probe', 'splice'}.
+            Default: all three.
+        seed: RNG seed for reproducibility.
+    """
+    job = SESSION.jobs.get(job_id) if job_id \
+          else next(iter(SESSION.jobs.values()), None)
+    if job is None: return _err("no fuzz job — start one first")
+    in_dir = WORK_DIR / "in"
+    if not in_dir.is_dir() or not any(in_dir.iterdir()):
+        return _err("corpus is empty — nothing to base mutations on")
+
+    strategies = strategies or ["magic_overlay", "length_probe", "splice"]
+    offsets = offsets or [0, 4, 8, 12, 16, 24, 32]
+    rng = random.Random(seed)
+
+    # Snapshot the current corpus once
+    corpus_files = [p for p in sorted(in_dir.iterdir()) if p.is_file()]
+    corpus = [(p.name, p.read_bytes()) for p in corpus_files]
+
+    generated: list[tuple[str, bytes]] = []   # (name, payload)
+    notes: list[str] = []
+
+    # ---------- magic_overlay ----------
+    if "magic_overlay" in strategies:
+        if code_start and code_end and code_start < code_end:
+            # Pull immediates: scan compares first (high signal),
+            # then mov-style for completeness if too few found.
+            try:
+                imm_cmp = find_immediates(code_start, code_end, only_compares=True,
+                                          min_value=0)
+                imm_all = find_immediates(code_start, code_end, only_compares=False,
+                                          min_value=0x100)
+            except Exception as e:
+                return _err(f"find_immediates failed: {e}")
+            uniq = []
+            seen = set()
+            for evt in (imm_cmp.get("events", []) + imm_all.get("events", [])):
+                v = evt["value"]
+                if v in seen: continue
+                seen.add(v); uniq.append(v)
+            uniq = uniq[:32]   # cap to keep seed count sane
+            notes.append(f"magic_overlay: {len(uniq)} unique immediates "
+                         f"in [{hex(code_start)}, {hex(code_end)})")
+            target_count = max(1, count // len(strategies))
+            i = 0
+            while i < target_count and uniq:
+                base_name, base = corpus[rng.randrange(len(corpus))]
+                value = uniq[i % len(uniq)]
+                offset = offsets[(i // max(1, len(uniq))) % len(offsets)]
+                # Pick width based on magnitude
+                if value <= 0xFFFFFFFF:
+                    enc = struct.pack("<I", value & 0xFFFFFFFF)
+                else:
+                    enc = struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF)
+                if offset + len(enc) > len(base):
+                    pad = (offset + len(enc)) - len(base)
+                    payload = bytes(base) + b"\x00" * pad
+                else:
+                    payload = bytearray(base); payload[offset:offset+len(enc)] = enc
+                    payload = bytes(payload)
+                payload = payload[:offset] + enc + payload[offset+len(enc):]
+                name = f"plat_magic_{i:03d}_{value:#x}_off{offset}"
+                generated.append((name, payload))
+                i += 1
+        else:
+            notes.append("magic_overlay: skipped (code_start/code_end not provided)")
+
+    # ---------- length_probe ----------
+    if "length_probe" in strategies:
+        boundaries = [0, 1, 0xFF, 0x100, 0xFFF, 0x1000,
+                      0x7FFF, 0x8000, 0xFFFE, 0xFFFF, 0x10000, 0xFFFFFFFF]
+        len_offsets = [4, 6, 8, 12, 16]
+        target_count = max(1, count // len(strategies))
+        for i in range(target_count):
+            base_name, base = corpus[rng.randrange(len(corpus))]
+            v = boundaries[i % len(boundaries)]
+            off = len_offsets[(i // len(boundaries)) % len(len_offsets)]
+            enc = struct.pack("<I", v & 0xFFFFFFFF)
+            if off + 4 > len(base):
+                payload = bytes(base) + b"\x00" * (off + 4 - len(base))
+                payload = payload[:off] + enc + payload[off+4:]
+            else:
+                payload = bytes(base[:off]) + enc + bytes(base[off+4:])
+            name = f"plat_len_{i:03d}_v{v:#x}_off{off}"
+            generated.append((name, payload))
+        notes.append(f"length_probe: {target_count} seeds with boundary lengths")
+
+    # ---------- splice ----------
+    if "splice" in strategies and len(corpus) >= 2:
+        target_count = max(1, count // len(strategies))
+        for i in range(target_count):
+            a_name, a = corpus[rng.randrange(len(corpus))]
+            b_name, b = corpus[rng.randrange(len(corpus))]
+            if not a or not b: continue
+            cut_a = rng.randrange(1, len(a)) if len(a) > 1 else 1
+            cut_b = rng.randrange(0, len(b))
+            payload = bytes(a[:cut_a]) + bytes(b[cut_b:])
+            name = f"plat_splice_{i:03d}_{a_name[:8]}_{b_name[:8]}"
+            generated.append((name, payload))
+        notes.append(f"splice: {target_count} seeds")
+    elif "splice" in strategies:
+        notes.append("splice: skipped (need >=2 corpus seeds)")
+
+    # ---------- inject ----------
+    written = []
+    for name, payload in generated:
+        # cap payload size to a sensible max (matches typical fuzz_configure)
+        payload = payload[:8192]
+        p = job.inject_dir / name
+        p.write_bytes(payload)
+        written.append({"name": name, "size": len(payload)})
+
+    return {"ok": True,
+            "job_id": job.job_id,
+            "inject_dir": str(job.inject_dir),
+            "injected": len(written),
+            "strategies_used": strategies,
+            "notes": notes,
+            "samples": written[:10]}
+
+
+@mcp.tool()
 def fuzzing_advisor(job_id: str = "") -> dict:
     """Single dashboard call returning everything Claude needs to decide what
     to do next: live status, plateau verdict, coverage trend tail, last few
@@ -1407,9 +1707,16 @@ def fuzzing_advisor(job_id: str = "") -> dict:
     # Heuristic recommendation
     if advice["plateau"].get("plateau"):
         advice["next_action"] = (
-            "PLATEAU detected. Re-read disasm via analyze_input_handling near "
-            "the input parser, propose 5–10 structurally-novel seeds, then "
-            "call seed_add_many(seeds=[...], target='inject', job_id=...).")
+            "PLATEAU detected. Two options:\n"
+            "  (1) FAST/AUTOMATED: call fuzz_break_plateau(job_id=..., "
+            "code_start=<parser_start>, code_end=<parser_end>) — overlays "
+            "magics from disasm + length boundaries + splice. Mechanical, "
+            "works without further reasoning.\n"
+            "  (2) DEEPER/REASONED: re-read disasm via analyze_input_handling "
+            "around uncovered branches, hand-craft 5–10 structurally-novel "
+            "seeds, then seed_add_many(seeds=[...], target='inject', "
+            "job_id=...).\n"
+            "Try (1) first; if coverage still flat after a minute, do (2).")
     elif advice["recent_crashes"].get("crashes"):
         advice["next_action"] = (
             "Crashes present. Run crash_summarize on each, then crash_minimize "

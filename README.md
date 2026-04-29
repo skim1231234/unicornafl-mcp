@@ -41,7 +41,7 @@ cd unicornafl-mcp && ./setup.sh        # builds everything + auto-registers in C
 > [!IMPORTANT]
 > Fully quit and relaunch Claude Desktop after `setup.sh` finishes — it's the only manual step.
 
-That's it. `setup.sh` builds AFL++/Rust/unicornafl/venv **and** patches Claude Desktop's `claude_desktop_config.json` for you (existing entries preserved, with a timestamped backup). Open Claude Desktop's tools panel and you should see 46 `unicornafl` tools.
+That's it. `setup.sh` builds AFL++/Rust/unicornafl/venv **and** patches Claude Desktop's `claude_desktop_config.json` for you (existing entries preserved, with a timestamped backup). Open Claude Desktop's tools panel and you should see 48 `unicornafl` tools.
 
 ### Requirements
 
@@ -134,7 +134,7 @@ The template form (with placeholders) is in [`claude_desktop_config.example.json
 ```
 
 > [!IMPORTANT]
-> Fully quit and relaunch Claude Desktop — all 46 tools should appear in the tools panel.
+> Fully quit and relaunch Claude Desktop — all 48 tools should appear in the tools panel.
 
 ### Uninstall / unregister
 
@@ -153,7 +153,7 @@ You should see exactly three constants pulled out of the `cmp`/`tst` instruction
 
 ---
 
-## 🛠️ Tool catalog (46 tools)
+## 🛠️ Tool catalog (48 tools)
 
 ### Session / memory / registers
 
@@ -180,8 +180,8 @@ You should see exactly three constants pulled out of the `cmp`/`tst` instruction
 | Phase | Tools |
 |---|---|
 | **Input-structure inference** (paper §IV-A) | `analyze_input_handling`, `find_immediates`, `find_strings`, `probe_input_access`, `probe_compare_log` |
-| **Seed enrichment** (paper §IV-B) | `seed_describe`, `seed_add_many`, `template_seeds` |
-| **Coverage-plateau breaking** (paper §IV-C) | `fuzz_coverage_history`, `fuzz_plateau_check`, `fuzz_inject_seed`, `fuzzing_advisor` |
+| **Seed enrichment** (paper §IV-B) | `seed_describe`, `seed_add_many`, `template_seeds`, `seeds_from_struct_spec` ★ |
+| **Coverage-plateau breaking** (paper §IV-C) | `fuzz_coverage_history`, `fuzz_plateau_check`, `fuzz_break_plateau` ★, `fuzz_inject_seed`, `fuzzing_advisor` |
 | **Crash analysis** | `crash_summarize`, `crash_minimize` |
 
 Tool signatures are documented in the Claude Desktop tool panel and in `server.py` docstrings.
@@ -217,11 +217,88 @@ A typical cycle:
    - `fuzz_generate_harness` → `fuzz_test_harness` to verify → `fuzz_start`
 4. **Monitor / break plateaus** — every 30 s to a few minutes
    - `fuzzing_advisor(job_id)` — one call returns status + plateau verdict + coverage tail + crashes + a recommended next action
-   - If `plateau == True`: re-read disassembly around uncovered branches → `seed_add_many(target='inject', …)` for live injection
+   - If `plateau == True`, two paths:
+     - **Fast / mechanical** — `fuzz_break_plateau(job_id, code_start, code_end)` overlays disasm-derived magic constants at typical header offsets, probes length-field boundaries, and splices corpus pairs. Doesn't need Claude reasoning; runs in milliseconds.
+     - **Deep / reasoned** — re-read disassembly around uncovered branches → `seed_add_many(target='inject', …)` for hand-crafted seeds. Use when (1) didn't help.
 5. **Triage**
    - `crash_summarize` to bucket crashes → `crash_minimize` once per unique bucket
 
 This mirrors the paper's Algorithm 1 (`PlateauLen ≥ MaxPlateau → ChatNextMessage`), with the external LLM call replaced by Claude inside the chat context.
+
+---
+
+## 🤝 Pairs well with: [IDA Pro MCP](https://github.com/mrexodia/ida-pro-mcp)
+
+Plateau-breaking gets dramatically stronger when [`ida-pro-mcp`](https://github.com/mrexodia/ida-pro-mcp) is registered alongside `unicornafl-mcp` in Claude Desktop. Both servers run independently — Claude orchestrates them in a single chat: IDA provides *structural ground truth*, unicornafl applies that knowledge to a live AFL campaign.
+
+### What IDA unlocks (vs. raw memory analysis)
+
+| Signal | `unicornafl-mcp` alone | `+ ida-pro-mcp` |
+|---|---|---|
+| Function boundaries | guess via `code_start` / `code_end` | `lookup_funcs` returns prologue–epilogue exactly |
+| Magic constants | `find_immediates` over a memory range | `decompile` reveals `*(u32)msg == 0xAB7EC0DE`, plus xrefs to other parsers using the same magic |
+| Input layout | inferred from dynamic read pattern | typed structs (if user has typed them in IDA) → exact field offsets / widths |
+| Length field | guessed offsets `[4, 6, 8]` | `trace_data_flow` from a `memcpy` length argument back to input bytes |
+| Untaken branches | not directly visible | AFL bitmap × `basic_blocks` CFG → exact `b.ne` instructions never flipped |
+| Dispatch tables | not directly visible | `read_struct` over `g_DISPATCH[64]` → enumerates every valid `(gid, mid)` pair |
+
+### Workflow
+
+```
+[plateau detected via fuzz_plateau_check]
+  ↓
+ida-pro-mcp__decompile(<parser_va>)             # readable pseudocode
+ida-pro-mcp__list_globals(pattern=...)          # locate dispatch / msgdef tables
+ida-pro-mcp__read_struct(addr, stride, ...)     # enumerate valid IDs / fields
+ida-pro-mcp__xrefs_to(<parser_va>)              # find caller contexts
+  ↓ (Claude reasons over the structural facts)
+unicornafl-mcp__seeds_from_struct_spec(spec, target="inject", job_id=...)
+  ↓
+AFL picks them up via foreign-sync, plateau breaks
+```
+
+### Concrete example — protocol parser plateau
+
+Scenario: a campaign against an `Extract` parser has stalled because mechanical magic overlays keep getting rejected at the dispatch gate (`gid` not in the dispatch table).
+
+```python
+# 1. IDA — enumerate every valid (gid, mid) pair from the dispatch table
+ida__read_struct(addr=0x5BE05C8, stride=8, count=64)              # group pointers
+for gp in active_groups:
+    msgdefs = ida__read_struct(addr=gp, stride=56, terminator="mid==0")
+    valid_pairs += [(gid, m.mid) for m in msgdefs]
+
+# 2. unicornafl-mcp — one structurally-correct seed per pair
+spec = {
+  "size": 12,
+  "fields": [
+    {"offset": 0, "kind": "u32_le", "value":  0xAB7EC0DE},
+    {"offset": 4, "kind": "u8",     "values": [g << 3 for g, _ in valid_pairs]},
+    {"offset": 5, "kind": "u8",     "value":  0},
+    {"offset": 6, "kind": "u16_le", "value":  0},
+    {"offset": 8, "kind": "u16_le", "values": [m << 6 for _, m in valid_pairs]},
+    {"offset": 10,"kind": "u16_le", "value":  0},
+  ]
+}
+seeds_from_struct_spec(spec, count=200, target="inject", job_id=current_job)
+```
+
+Every emitted seed passes the magic + size + gid + msgdef + mid gates and lands inside the per-group native handler — exactly where the deeper, less-tested code lives. Tens-of-percent coverage gain in a single batch is normal for protocols with structured headers.
+
+### Setup pointer
+
+Install `ida-pro-mcp` per its [own README](https://github.com/mrexodia/ida-pro-mcp) and add it to Claude Desktop's `claude_desktop_config.json` alongside `unicornafl`:
+
+```json
+{
+  "mcpServers": {
+    "unicornafl": { "command": "...", "args": ["..."] },
+    "ida":        { "command": "...", "args": ["..."] }
+  }
+}
+```
+
+Both servers operate independently — no code changes needed in `unicornafl-mcp`. Claude can call both in the same chat turn.
 
 ---
 
@@ -230,7 +307,7 @@ This mirrors the paper's Algorithm 1 (`PlateauLen ≥ MaxPlateau → ChatNextMes
 ```
 unicornafl-mcp/
 ├── setup.sh
-├── server.py                          # MCP server (~1500 lines, 46 tools)
+├── server.py                          # MCP server (~1800 lines, 48 tools)
 ├── harness_template.py                # filled in by fuzz_generate_harness → work/harness.py
 ├── claude_desktop_config.example.json # template with /path/to/... placeholders
 ├── claude_desktop_config.local.json   # generated by setup.sh, real paths (gitignored)
